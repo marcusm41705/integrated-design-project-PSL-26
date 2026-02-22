@@ -1,0 +1,373 @@
+#include <avr/io.h> //Part of standard C libraries and also not external
+#include <stdint.h> //standard header file and not external
+#define EEPROM_PIN_BASE 0 //
+#define EEPROM_ADDR 10 //
+#define EEPROM_VAL 0xA5 //This prevents the reading of corrupted or 
+//uninitialized data when the Arduino goes through a power cycle
+#define PASS_LENGTH 4 //password length
+#define TIMEOUT_MS 15000 //15 seconds for timeout
+#define ERROR_MS 1500 //Delay to hold error state
+#define ROW_NUM 4 /**/
+#define COL_NUM 3
+#define DELAY_T 5
+#define SERIAL_B 9600 //Baud rate for Serial
+#define SERVO_PIN 9 //Pin that controls 
+#define LOCKED_US    600
+#define UNLOCKED_US  2400
+//start of KEYPAD_VERIFICATION
+
+//Start of state machine
+enum State{
+  SLEEP, //Currently standing as a placeholder until Milestone 3
+  LOCKED, //Servo motor in locked mode
+  INPUT_STATE, //collects and reads the digits from the keypad, * to clear, # to submit
+  CHECK_PW, //Validates the entry[] against a saved password
+  UNLOCKED, //Servo motor in unlocked mode, use '#' to lock
+  ERROR, //shows the error feedback, then returns to INPUT_STATE
+  REPROGRAM //State to reprogram the password
+};
+
+State state = LOCKED;
+char saved_password[PASS_LENGTH + 1] = {0}; //No longer hardcoded
+char entry[PASS_LENGTH + 1] = {0};
+uint8_t entryLength = 0;
+
+unsigned long last_input_ms = 0;
+unsigned long  error_start_ms = 0;
+//Keypad settings here
+
+int pinRows[ROW_NUM]= {2, 3, 4, 5}; //Setting up pins to be used for the columns
+ int pinCols[COL_NUM]= {6, 7, 8}; //Setting up pins to be used for the rows
+
+ char KEYMAP[ROW_NUM][COL_NUM] = {
+                        {'1', '2', '3'}, //main matrix used to return values to the keypad
+                        {'4', '5', '6'}, 
+                        {'7', '8', '9'}, 
+                        {'*', '0', '#'} 
+                        };
+
+//Keypad functions here
+char scan_keypad_once(){
+  //row = i
+  //col = j
+  for (int i=0; i < ROW_NUM; ++i){
+    digitalWrite(pinRows[i], HIGH); //Setting all the row pins to HIGH
+  }
+
+  for (int i = 0; i < ROW_NUM; ++i){ //Start a scan for each row
+    digitalWrite(pinRows[i],LOW); //Start every row set at 0
+    delayMicroseconds(DELAY_T); //CHECK
+    for (int j = 0; j < COL_NUM; j++){
+      if(digitalRead(pinCols[j]) == LOW){ //if 0,
+        digitalWrite(pinRows[i], HIGH); //Then set pin to HIGH (1)
+        return KEYMAP[i][j];
+      } //end of IF loop
+    } //end of FOR LOOP 
+    digitalWrite(pinRows[i],HIGH); //Restoring row to HIGH
+  }//end of FOR loop
+return '\0'; 
+}//end of function loop
+
+char get_key(){
+  static bool buttonPressed = false; //Boolean variable to determine if a button is pressed
+  char scan = scan_keypad_once();
+  if(scan != '\0' && !buttonPressed){
+    buttonPressed = true;
+    delay(20);
+    if(scan_keypad_once() == scan){
+      return scan;
+    }
+  }
+
+  if(scan == '\0'){ //if the keypad returns NULL character
+    buttonPressed = false; //This means button is released
+  }
+
+return '\0';
+
+} //end of function loop 
+
+
+//SERVO Functions HERE
+static inline void setServoPulseUs(uint16_t pulse_us) {
+  // Timer1 tick = 0.5 us when prescaler = 8 (16MHz / 8 = 2MHz)
+  // ticks = pulse_us / 0.5us = pulse_us * 2
+  uint16_t ticks = pulse_us * 2;
+
+
+  // Safety clamp so you don't command insane widths
+  if (ticks < 1000) ticks = 1000;      // 500 us
+  if (ticks > 5000) ticks = 5000;      // 2500 us
+
+
+  OCR1A = ticks;
+}
+
+
+void setupTimer1_50Hz() {
+  pinMode(SERVO_PIN, OUTPUT);
+
+
+  // Stop Timer1
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+
+
+  // Fast PWM, TOP = ICR1  (Mode 14: WGM13:0 = 1110)
+  // Clear OC1A on compare match, set at BOTTOM (non-inverting)
+  TCCR1A = (1 << COM1A1) | (1 << WGM11);
+  TCCR1B = (1 << WGM13) | (1 << WGM12);
+
+
+  // Prescaler = 8
+  TCCR1B |= (1 << CS11);
+
+
+  // TOP for 50Hz:
+  // 16MHz / 8 = 2MHz => 0.5us per tick
+  // 20ms / 0.5us = 40000 ticks -> TOP = 39999
+  ICR1 = 39999;
+
+
+  // Start at LOCKED
+  setServoPulseUs(LOCKED_US);
+}
+
+static inline void servo_set_locked(){ //Function to set the servo motor to the locked position
+  setServoPulseUs(LOCKED_US);
+}
+
+static inline void servo_set_unlocked(){ //Function to set the servo motor to the unlocked position
+  setServoPulseUs(UNLOCKED_US);
+}
+//SERVO SETTINGS HERE
+void entry_clear(){ //This clears the password entered in the system
+  entryLength = 0; //Reset entryLength to zero
+  entry[0] = '\0';
+}
+void entry_append(char digit){ // Appends a null character to the password 
+  if(entryLength < PASS_LENGTH){ //In order to create a "finished" password
+    entry[entryLength++] = digit;
+    entry[entryLength] = '\0'; //Will make the last digit a nullifying character
+  }
+}
+bool entryComplete(){ //Bool function to check if the password is 4 digits
+  if(entryLength == PASS_LENGTH){
+    return true;
+  } else {
+    return false;
+  }
+}
+bool entry_matches_saved(){ //This function checks to see if the saved password = the entered
+  for(uint8_t i = 0; i < PASS_LENGTH; ++i){
+    if(entry[i] != saved_password[i]){
+      return false;
+    }
+  }
+  return true;
+}
+
+//EEPROM functions
+
+/* Instead of using eeprom functions, instead we have to use the registers:
+EEAR: Address Register
+EEDR: Data Register
+EECR: Control Register
+If we can use the functions, I'll check back in with Milburn bc it would make code
+much shorter.
+*/
+
+static inline uint8_t eeprom_read_byte(uint16_t addr){ //This returns a byte from Arduino saved data
+  while (EECR & (1 << EEPE)) {
+    }
+    //Waits while the EEPROM is busy
+    EEAR = addr; //Set EEPROM address
+    EECR |= (1 << EERE); //This triggers the actual read itself
+    return EEDR; //return data
+  
+}
+static inline void eeprom_write_byte(uint16_t addr, uint8_t data){ //This will write a byte to the Arduino saved data
+  while(EECR & (1 << EEPE)){
+
+  } //Waits while the EEPROM is busy
+    EEAR = addr; //Sets the EEPROm address
+    EEDR = data; //Sets the data from parameter
+    EECR |= (1 << EEMPE); //master write enable
+    EECR |= (1 << EEPE); //start writing
+  
+}
+void save_pw_to_eeprom(const char* PWD){ //Stores ascii digits into EEPROM addresses 0-3
+  for (uint8_t i = 0; i < PASS_LENGTH; ++i){
+    eeprom_write_byte(EEPROM_PIN_BASE + i, (uint8_t)PWD[i]);
+  } 
+}
+
+void load_pw_from_eeprom(char* outPWD){ //Loads the ascii digits from saved data
+  for (uint8_t i = 0; i < PASS_LENGTH;++i){
+    outPWD[i]= (char)eeprom_read_byte(EEPROM_PIN_BASE + i);
+  }
+  outPWD[PASS_LENGTH] = '\0';
+}
+bool eeprom_is_initialized(){ //If address 10 contains 0xA5, the EEPROM value is valid
+  return eeprom_read_byte(EEPROM_ADDR) == EEPROM_VAL;
+}
+void eeprom_initialize_if_needed(char* outPWD){
+  if(!eeprom_is_initialized()){
+    //store default on first run
+    save_pw_to_eeprom("1234");
+    eeprom_write_byte(EEPROM_ADDR, EEPROM_VAL); //Load into ram
+  }
+  load_pw_from_eeprom(outPWD);//Load the existing PIN
+}
+void setup(){
+Serial.begin(SERIAL_B);
+last_input_ms = millis(); //Using millis to measure elapsed time
+
+//KEYPAD pinMode setup from 2a
+ for (int row = 0; row < ROW_NUM; ++row){
+    pinMode(pinRows[row], OUTPUT); //Setting the rows to become outputs
+    digitalWrite(pinRows[row], HIGH); //Making these rows high
+  }
+
+  for(int col = 0; col < COL_NUM; ++col){
+    pinMode(pinCols[col], INPUT_PULLUP);//Setting the columns to becomes 
+  }
+//SERVO setup from 2b
+setupTimer1_50Hz();
+servo_set_locked();
+
+eeprom_initialize_if_needed(saved_password);
+
+/* DEBUG to check what password is saved beforehand
+Serial.print("Saved Pin loaded='");
+Serial.print(saved_password);
+Serial.println("'");
+Serial.print("Saved PIN bytes: ");
+for(int i = 0; i < PASS_LENGTH; ++i){
+  Serial.print((uint8_t)saved_password[i], HEX);
+  Serial.print(" ");
+}
+Serial.println();
+*/
+Serial.println("Locker is ready. Enter 4 digit PIN:");
+
+}
+
+void loop(){
+  
+  char key = get_key();
+  if(key != '\0'){
+    last_input_ms = millis(); //Whenever the user presses a key, last_input_ms records the time
+  }
+  if((millis()- last_input_ms) > TIMEOUT_MS){ //If more than fifteen seconds, time out 
+    //MILESTONE 3 here is sleep mode. 
+    entry_clear(); //clear the current entry
+    //reset the system
+    servo_set_locked();
+    state = LOCKED;
+  }
+  
+  switch(state){
+    case LOCKED:
+    //if(key!= '\0'){ //Press a key first to wake up the system
+    // state = INPUT_STATE;
+    //}
+    state = INPUT_STATE;
+    break;
+
+    case INPUT_STATE:
+    if(key == '\0'){ break;}
+    if(key >= '0' && key <= '9'){ //Bounds for password
+      entry_append(key);
+      Serial.print("Entered: ");
+      Serial.println(entry); 
+
+    } else if(key == '*'){ //* = cleared password
+      entry_clear();
+      Serial.println("Cleared.");
+    } else if(key == '#'){ //# = submit password
+    Serial.println("Submitted");
+      state = CHECK_PW;
+    }
+
+    //For future, I will probably update this part to 
+    //automatically submit when the max password length is reached.
+    break;
+
+    case CHECK_PW:
+    
+    if(!entryComplete()){ //System does not validate until password is complete
+      Serial.println("Password Incomplete. Try again: ");
+      state = INPUT_STATE;//return to input 
+      break;
+    }
+    
+    //compare entered to saved password
+    if(entry_matches_saved()){
+      Serial.println("Correct Password , unlocked.");
+      servo_set_unlocked();
+      state = UNLOCKED;
+    } else {
+      Serial.println("Incorrect Password");
+      error_start_ms = millis();
+      state = ERROR;
+    }
+    entry_clear(); //Cleared after checking
+    break;
+
+    case UNLOCKED:
+    if (key == '*'){ // Using "*" as the lock button
+      Serial.println("Locking.");
+      servo_set_locked();
+      state = LOCKED;
+      entry_clear();
+    } else if(key == '#'){
+      Serial.println("Enter new password:");
+      entry_clear();
+      state = REPROGRAM; /
+    }
+    break;
+
+  case ERROR:
+  if((millis()-error_start_ms) > ERROR_MS){ //Hold the error state
+    Serial.println("Error, try again:");
+    state = INPUT_STATE; //Allows the user to try again
+  }
+    break;
+    
+    case SLEEP: //Placeholder for Milestone 3
+    default:
+    state = LOCKED;
+    break;
+
+  case REPROGRAM: //Reprogram is much like the input, with the exception that 
+                  //it saves the result to EEPROM, which allows you to make a new
+                  //PIN number
+  if(key == '\0'){
+    break;
+  }
+  if(key >= '0' && key <= '9'){
+    entry_append(key);
+    Serial.print("New PIN: ");
+    Serial.println(entry);
+    
+  } else if( key == '*'){
+    entry_clear();
+    Serial.println("Cleared new PIN.");
+  } else if(key == '#'){
+    if(!entryComplete()){
+      Serial.println("New PIN incomplete. Enter 4 digits.");
+      break;
+    }
+    save_pw_to_eeprom(entry);//Save the entered password to EEPROM
+    load_pw_from_eeprom(saved_password); //Load the now active password from EEPROM
+    Serial.println("New PIN saved.");
+    entry_clear();
+    servo_set_locked();
+    state = LOCKED;
+  }
+  break;
+
+  } //end of switch statement
+}
