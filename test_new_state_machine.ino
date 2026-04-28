@@ -730,9 +730,7 @@ void loop(){
       entry_clear();
       state = REPROGRAM; //
     }
-    if((millis()- last_input_ms) > TIMEOUT_MS){ //If more than fifteen seconds, time out 
-    state = SLEEP;
-  }
+
     break;
 
   case ERROR:
